@@ -3,6 +3,10 @@
 import QRCode from "react-qr-code";
 import { useCallback, useEffect, useRef, useState } from "react";
 
+/** Shown when pc.connectionState === "failed" (host + guest). */
+const WEBRTC_CONNECTION_FAILED_HINT =
+  "WebRTC connection failed. Corporate or guest Wi‑Fi often blocks direct peer links; network admins may block UDP or public TURN hosts. Try another network, same LAN without AP isolation, or set NEXT_PUBLIC_TURN_URL (comma‑separate multiple URLs), NEXT_PUBLIC_TURN_USERNAME, and NEXT_PUBLIC_TURN_CREDENTIAL on Vercel—prefer turns:…:443 if your provider offers TLS.";
+
 function buildIceServers(): RTCIceServer[] {
   const base: RTCIceServer[] = [
     { urls: "stun:stun.l.google.com:19302" },
@@ -17,15 +21,21 @@ function buildIceServers(): RTCIceServer[] {
       credential: "openrelayproject",
     },
   ];
-  const turnUrl = process.env.NEXT_PUBLIC_TURN_URL;
+  const turnUrl = process.env.NEXT_PUBLIC_TURN_URL?.trim();
   const turnUser = process.env.NEXT_PUBLIC_TURN_USERNAME;
   const turnCred = process.env.NEXT_PUBLIC_TURN_CREDENTIAL;
   if (turnUrl && turnUser !== undefined && turnCred !== undefined) {
-    base.push({
-      urls: turnUrl,
-      username: turnUser,
-      credential: turnCred,
-    });
+    const urls = turnUrl
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (urls.length > 0) {
+      base.push({
+        urls: urls.length === 1 ? urls[0]! : urls,
+        username: turnUser,
+        credential: turnCred,
+      });
+    }
   }
   return base;
 }
@@ -290,9 +300,7 @@ export function P2PTransfer() {
       });
       if (s === "failed") {
         appendDebug("[host] connectionState=failed");
-        setError(
-          "WebRTC connection failed. Try same Wi‑Fi, or add NEXT_PUBLIC_TURN_* in Vercel."
-        );
+        setError(WEBRTC_CONNECTION_FAILED_HINT);
       }
     };
 
@@ -478,9 +486,7 @@ export function P2PTransfer() {
       });
       if (s === "failed") {
         appendDebug("[guest] connectionState=failed");
-        setError(
-          "WebRTC connection failed. Try same Wi‑Fi, or add NEXT_PUBLIC_TURN_* in Vercel."
-        );
+        setError(WEBRTC_CONNECTION_FAILED_HINT);
       }
     };
 
