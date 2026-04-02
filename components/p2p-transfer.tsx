@@ -3,10 +3,32 @@
 import QRCode from "react-qr-code";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-const ICE_SERVERS: RTCIceServer[] = [
-  { urls: "stun:stun.l.google.com:19302" },
-  { urls: "stun:stun1.l.google.com:19302" },
-];
+function buildIceServers(): RTCIceServer[] {
+  const base: RTCIceServer[] = [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    {
+      urls: [
+        "turn:openrelay.metered.ca:80",
+        "turn:openrelay.metered.ca:443",
+        "turn:openrelay.metered.ca:443?transport=tcp",
+      ],
+      username: "openrelayproject",
+      credential: "openrelayproject",
+    },
+  ];
+  const turnUrl = process.env.NEXT_PUBLIC_TURN_URL;
+  const turnUser = process.env.NEXT_PUBLIC_TURN_USERNAME;
+  const turnCred = process.env.NEXT_PUBLIC_TURN_CREDENTIAL;
+  if (turnUrl && turnUser !== undefined && turnCred !== undefined) {
+    base.push({
+      urls: turnUrl,
+      username: turnUser,
+      credential: turnCred,
+    });
+  }
+  return base;
+}
 
 const POLL_MS = 400;
 const MAX_BUFFER = 256 * 1024;
@@ -62,10 +84,6 @@ export function P2PTransfer() {
   }, [stopPolling]);
 
   useEffect(() => {
-    return () => teardown();
-  }, [teardown]);
-
-  useEffect(() => {
     if (typeof window === "undefined") return;
     const params = new URLSearchParams(window.location.search);
     const join = params.get("join");
@@ -113,27 +131,17 @@ export function P2PTransfer() {
             /* ignore */
           }
         }
+        if (!pc.currentRemoteDescription) {
+          return;
+        }
         const list = data.iceGuest;
         for (let i = guestIceIdx.current; i < list.length; i++) {
           const raw = list[i];
-          guestIceIdx.current = i + 1;
-          if (raw === null) continue;
           try {
             await pc.addIceCandidate(raw);
+            guestIceIdx.current = i + 1;
           } catch {
-            /* ignore */
-          }
-        }
-      } else {
-        const list = data.iceHost;
-        for (let i = hostIceIdx.current; i < list.length; i++) {
-          const raw = list[i];
-          hostIceIdx.current = i + 1;
-          if (raw === null) continue;
-          try {
-            await pc.addIceCandidate(raw);
-          } catch {
-            /* ignore */
+            break;
           }
         }
       }
@@ -168,8 +176,17 @@ export function P2PTransfer() {
     setMode("host");
     setStatus("Connecting…");
 
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    const pc = new RTCPeerConnection({ iceServers: buildIceServers() });
     pcRef.current = pc;
+
+    pc.onconnectionstatechange = () => {
+      const s = pc.connectionState;
+      if (s === "failed") {
+        setError(
+          "WebRTC connection failed. Different Wi‑Fi/mobile networks often need a TURN server — set NEXT_PUBLIC_TURN_* env vars."
+        );
+      }
+    };
 
     const dc = pc.createDataChannel("file", { ordered: true });
     dcRef.current = dc;
@@ -245,8 +262,8 @@ export function P2PTransfer() {
     []
   );
 
-  const joinAsGuest = useCallback(async () => {
-    const code = guestInput.trim().toUpperCase();
+  const joinAsGuest = useCallback(async (codeOverride?: string) => {
+    const code = (codeOverride ?? guestInput).trim().toUpperCase();
     if (!/^[A-Z2-9]{6}$/.test(code)) {
       setError("Enter a 6-character room code.");
       return;
@@ -261,8 +278,17 @@ export function P2PTransfer() {
     setMode("guest");
     setStatus("Connecting…");
 
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    const pc = new RTCPeerConnection({ iceServers: buildIceServers() });
     pcRef.current = pc;
+
+    pc.onconnectionstatechange = () => {
+      const s = pc.connectionState;
+      if (s === "failed") {
+        setError(
+          "WebRTC connection failed. Different Wi‑Fi/mobile networks often need a TURN server — set NEXT_PUBLIC_TURN_* env vars."
+        );
+      }
+    };
 
     pc.onicecandidate = (e) => {
       void pushIce(code, "guest", e.candidate);
@@ -344,7 +370,7 @@ export function P2PTransfer() {
         iceGuest: (RTCIceCandidateInit | null)[];
       };
 
-      if (data.offer && !pc.remoteDescription) {
+      if (data.offer && !pc.currentRemoteDescription) {
         try {
           await pc.setRemoteDescription(
             new RTCSessionDescription(data.offer)
@@ -364,14 +390,17 @@ export function P2PTransfer() {
         }
       }
 
+      if (!pc.currentRemoteDescription) {
+        return;
+      }
+
       for (let i = hostIceIdx.current; i < data.iceHost.length; i++) {
         const raw = data.iceHost[i];
-        hostIceIdx.current = i + 1;
-        if (raw === null) continue;
         try {
           await pc.addIceCandidate(raw);
+          hostIceIdx.current = i + 1;
         } catch {
-          /* ignore */
+          break;
         }
       }
     }, POLL_MS);
@@ -434,6 +463,10 @@ export function P2PTransfer() {
                 Join
               </button>
             </div>
+            <p className="mt-2 text-xs text-zinc-500">
+              After scanning the QR or opening the link, tap Join — the page does
+              not connect until you do.
+            </p>
           </div>
         </div>
       )}
