@@ -9,5 +9,11 @@ export function getRedis(): Redis | null {
   if (!url || !token) {
     return null;
   }
-  return new Redis({ url, token });
+  return new Redis({
+    url,
+    token,
+    // We store JSON strings and parse in signaling-room; Upstash otherwise
+    // auto-parses GET/LRANGE values into objects, which breaks JSON.parse(raw).
+    automaticDeserialization: false,
+  });
 }
