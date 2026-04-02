@@ -34,7 +34,26 @@ const POLL_MS = 400;
 const MAX_BUFFER = 256 * 1024;
 const CHUNK_SIZE = 16 * 1024;
 
+const DATA_ONLY_OFFER: RTCOfferOptions = {
+  offerToReceiveAudio: false,
+  offerToReceiveVideo: false,
+};
+
+const DATA_ONLY_ANSWER: RTCAnswerOptions = {
+  offerToReceiveAudio: false,
+  offerToReceiveVideo: false,
+};
+
 type UiMode = "home" | "host" | "guest" | "error";
+
+type DebugLine = { id: number; t: string; msg: string };
+
+const DEBUG_MAX_LINES = 120;
+
+function timeStamp(): string {
+  const d = new Date();
+  return d.toISOString().slice(11, 23);
+}
 
 async function waitForBuffer(dc: RTCDataChannel): Promise<void> {
   if (dc.bufferedAmount < MAX_BUFFER) return;
@@ -48,6 +67,21 @@ async function waitForBuffer(dc: RTCDataChannel): Promise<void> {
   });
 }
 
+async function addIceCandidateSafe(
+  pc: RTCPeerConnection,
+  raw: RTCIceCandidateInit | null
+): Promise<void> {
+  if (raw === null) {
+    await pc.addIceCandidate(null);
+    return;
+  }
+  try {
+    await pc.addIceCandidate(new RTCIceCandidate(raw));
+  } catch {
+    await pc.addIceCandidate(raw);
+  }
+}
+
 export function P2PTransfer() {
   const [mode, setMode] = useState<UiMode>("home");
   const [roomCode, setRoomCode] = useState("");
@@ -57,17 +91,39 @@ export function P2PTransfer() {
   const [joinUrl, setJoinUrl] = useState("");
   const [progress, setProgress] = useState<number | null>(null);
   const [connected, setConnected] = useState(false);
+  const [debugLines, setDebugLines] = useState<DebugLine[]>([]);
+  const debugId = useRef(0);
+
+  const appendDebug = useCallback((msg: string) => {
+    const t = timeStamp();
+    setDebugLines((prev) => {
+      debugId.current += 1;
+      const line: DebugLine = { id: debugId.current, t, msg };
+      return [...prev, line].slice(-DEBUG_MAX_LINES);
+    });
+  }, []);
+
+  const clearDebug = useCallback(() => {
+    setDebugLines([]);
+  }, []);
+
+  const copyDebugLog = useCallback(() => {
+    const text = debugLines.map((l) => `${l.t}  ${l.msg}`).join("\n");
+    void navigator.clipboard.writeText(text).catch(() => {});
+  }, [debugLines]);
 
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollRef = useRef<number | null>(null);
   const hostIceIdx = useRef(0);
   const guestIceIdx = useRef(0);
   const abortRef = useRef(false);
+  const hostPollBusy = useRef(false);
+  const guestPollBusy = useRef(false);
 
   const stopPolling = useCallback(() => {
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
+    if (pollRef.current !== null) {
+      window.clearTimeout(pollRef.current);
       pollRef.current = null;
     }
   }, []);
@@ -95,11 +151,14 @@ export function P2PTransfer() {
   const pushIce = useCallback(
     async (code: string, role: "host" | "guest", c: RTCIceCandidate | null) => {
       const candidate = c ? c.toJSON() : null;
-      await fetch(`/api/signaling/rooms/${code}`, {
+      const res = await fetch(`/api/signaling/rooms/${code}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ kind: "ice", role, candidate }),
       });
+      if (!res.ok) {
+        console.warn("ICE signaling POST failed", res.status);
+      }
     },
     []
   );
@@ -108,12 +167,20 @@ export function P2PTransfer() {
     async (
       code: string,
       role: "host" | "guest",
-      pc: RTCPeerConnection
+      pc: RTCPeerConnection,
+      log: (m: string) => void
     ) => {
-      const res = await fetch(`/api/signaling/rooms/${code}`, {
-        cache: "no-store",
-      });
-      if (!res.ok) return;
+      const res = await fetch(
+        `/api/signaling/rooms/${code}?_=${Date.now()}`,
+        {
+          cache: "no-store",
+          headers: { "Cache-Control": "no-cache" },
+        }
+      );
+      if (!res.ok) {
+        log(`signaling GET failed: HTTP ${res.status}`);
+        return;
+      }
       const data = (await res.json()) as {
         offer: RTCSessionDescriptionInit | null;
         answer: RTCSessionDescriptionInit | null;
@@ -121,45 +188,62 @@ export function P2PTransfer() {
         iceGuest: (RTCIceCandidateInit | null)[];
       };
 
+      log(
+        `signaling snapshot: hasOffer=${!!data.offer} hasAnswer=${!!data.answer} iceHost=${data.iceHost.length} iceGuest=${data.iceGuest.length}`
+      );
+
       if (role === "host") {
         if (data.answer && !pc.currentRemoteDescription) {
           try {
             await pc.setRemoteDescription(
               new RTCSessionDescription(data.answer)
             );
-          } catch {
-            /* ignore */
+            log("host: setRemoteDescription(answer) OK");
+          } catch (e) {
+            console.error("Host setRemoteDescription(answer)", e);
+            log(`host: setRemoteDescription(answer) ERROR ${String(e)}`);
+            setError("Could not apply answer from peer. Try again.");
           }
         }
         if (!pc.currentRemoteDescription) {
           return;
         }
         const list = data.iceGuest;
+        let added = 0;
         for (let i = guestIceIdx.current; i < list.length; i++) {
           const raw = list[i];
           try {
-            await pc.addIceCandidate(raw);
+            await addIceCandidateSafe(pc, raw);
             guestIceIdx.current = i + 1;
-          } catch {
+            added++;
+          } catch (e) {
+            log(`host: addIceCandidate stopped: ${String(e)}`);
+            console.warn("Host addIceCandidate", e);
             break;
           }
         }
+        if (added > 0) {
+          log(`host: applied ${added} guest ICE candidate(s)`);
+        }
       }
     },
-    []
+    [setError]
   );
 
   const startHost = useCallback(async () => {
     setError(null);
     setProgress(null);
     setConnected(false);
+    setDebugLines([]);
     teardown();
     abortRef.current = false;
     setStatus("Creating room…");
+    appendDebug(`[host] start (page=${typeof window !== "undefined" ? window.location.href : ""})`);
 
     const roomRes = await fetch("/api/signaling/rooms", { method: "POST" });
     if (!roomRes.ok) {
       const j = (await roomRes.json().catch(() => ({}))) as { error?: string };
+      appendDebug(`[host] POST /api/signaling/rooms failed: HTTP ${roomRes.status}`);
       setError(
         j.error ??
           "Could not create a room. Configure Redis (Upstash) on Vercel."
@@ -169,6 +253,7 @@ export function P2PTransfer() {
     }
 
     const { roomCode: code } = (await roomRes.json()) as { roomCode: string };
+    appendDebug(`[host] room created: ${code}`);
     setRoomCode(code);
     const origin = window.location.origin;
     const path = window.location.pathname || "/";
@@ -179,36 +264,63 @@ export function P2PTransfer() {
     const pc = new RTCPeerConnection({ iceServers: buildIceServers() });
     pcRef.current = pc;
 
+    const logPc = (label: string) => {
+      appendDebug(
+        `[host] ${label}: signaling=${pc.signalingState} conn=${pc.connectionState} iceConn=${pc.iceConnectionState} iceGather=${pc.iceGatheringState}`
+      );
+    };
+
     pc.onconnectionstatechange = () => {
+      logPc("onconnectionstatechange");
       const s = pc.connectionState;
+      setStatus((prev) => {
+        if (prev.startsWith("Connected")) return prev;
+        return `Link: ${s} · ICE: ${pc.iceConnectionState}`;
+      });
       if (s === "failed") {
+        appendDebug("[host] connectionState=failed");
         setError(
-          "WebRTC connection failed. Different Wi‑Fi/mobile networks often need a TURN server — set NEXT_PUBLIC_TURN_* env vars."
+          "WebRTC connection failed. Try same Wi‑Fi, or add NEXT_PUBLIC_TURN_* in Vercel."
         );
       }
     };
+
+    pc.oniceconnectionstatechange = () => logPc("oniceconnectionstatechange");
+    pc.onicegatheringstatechange = () => logPc("onicegatheringstatechange");
+    pc.onsignalingstatechange = () => logPc("onsignalingstatechange");
 
     const dc = pc.createDataChannel("file", { ordered: true });
     dcRef.current = dc;
 
     dc.onopen = () => {
       if (abortRef.current) return;
+      appendDebug(`[host] dataChannel onopen (label=${dc.label} id=${dc.id})`);
       setConnected(true);
       setStatus("Connected. Choose a file to send.");
     };
 
     dc.onerror = () => {
+      appendDebug("[host] dataChannel onerror");
       setError("Data channel error");
     };
 
+    dc.onclose = () => {
+      appendDebug(`[host] dataChannel onclose (readyState=${dc.readyState})`);
+    };
+
+    let hostIceOut = 0;
     pc.onicecandidate = (e) => {
+      if (e.candidate) hostIceOut++;
+      else appendDebug(`[host] ICE gathering complete (sent ${hostIceOut} candidates)`);
       void pushIce(code, "host", e.candidate);
     };
 
     try {
-      const offer = await pc.createOffer();
+      appendDebug("[host] creating offer + setLocalDescription…");
+      const offer = await pc.createOffer(DATA_ONLY_OFFER);
       await pc.setLocalDescription(offer);
-      await fetch(`/api/signaling/rooms/${code}`, {
+      logPc("after setLocalDescription(offer)");
+      const postOffer = await fetch(`/api/signaling/rooms/${code}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -216,25 +328,54 @@ export function P2PTransfer() {
           sdp: pc.localDescription!,
         }),
       });
-    } catch {
-      setError("Could not start WebRTC offer");
+      if (!postOffer.ok) {
+        const t = await postOffer.text();
+        throw new Error(t || `Offer HTTP ${postOffer.status}`);
+      }
+      appendDebug(`[host] offer POST OK (${(pc.localDescription?.sdp?.length ?? 0)} chars sdp)`);
+    } catch (e) {
+      appendDebug(`[host] offer failed: ${String(e)}`);
+      console.error(e);
+      setError("Could not publish WebRTC offer. Check network and try again.");
       setMode("error");
       teardown();
       return;
     }
 
-    pollRef.current = setInterval(() => {
-      void pollSignaling(code, "host", pc);
-    }, POLL_MS);
-  }, [pollSignaling, pushIce, teardown]);
+    let hostPollN = 0;
+    const hostPollLoop = async () => {
+      if (abortRef.current) return;
+      if (hostPollBusy.current) {
+        pollRef.current = window.setTimeout(() => void hostPollLoop(), POLL_MS);
+        return;
+      }
+      hostPollBusy.current = true;
+      try {
+        hostPollN += 1;
+        appendDebug(`--- host signaling poll #${hostPollN} ---`);
+        await pollSignaling(code, "host", pc, appendDebug);
+      } finally {
+        hostPollBusy.current = false;
+      }
+      if (!abortRef.current) {
+        pollRef.current = window.setTimeout(() => void hostPollLoop(), POLL_MS);
+      }
+    };
+    appendDebug("[host] starting signaling poll loop");
+    pollRef.current = window.setTimeout(() => void hostPollLoop(), 0);
+  }, [appendDebug, pollSignaling, pushIce, teardown]);
 
   const sendFile = useCallback(
     async (file: File) => {
       const dc = dcRef.current;
       if (!dc || dc.readyState !== "open") {
+        appendDebug(`[host] sendFile blocked: dc=${dc ? dc.readyState : "null"}`);
         setError("Channel not ready");
         return;
       }
+      appendDebug(
+        `[host] send start: ${file.name} (${file.size} bytes, ${file.type || "no type"})`
+      );
       setProgress(0);
       setStatus(`Sending ${file.name}…`);
 
@@ -256,10 +397,11 @@ export function P2PTransfer() {
         setProgress(Math.round((offset / buf.byteLength) * 100));
       }
 
+      appendDebug(`[host] send finished: ${file.name}`);
       setProgress(null);
       setStatus("Sent. You can send another file or close the tab.");
     },
-    []
+    [appendDebug]
   );
 
   const joinAsGuest = useCallback(async (codeOverride?: string) => {
@@ -272,30 +414,61 @@ export function P2PTransfer() {
     setError(null);
     setProgress(null);
     setConnected(false);
+    setDebugLines([]);
     teardown();
     abortRef.current = false;
     setRoomCode(code);
     setMode("guest");
     setStatus("Connecting…");
+    appendDebug(
+      `[guest] start room=${code} (page=${typeof window !== "undefined" ? window.location.href : ""})`
+    );
 
     const pc = new RTCPeerConnection({ iceServers: buildIceServers() });
     pcRef.current = pc;
 
+    const logPc = (label: string) => {
+      appendDebug(
+        `[guest] ${label}: signaling=${pc.signalingState} conn=${pc.connectionState} iceConn=${pc.iceConnectionState} iceGather=${pc.iceGatheringState}`
+      );
+    };
+
     pc.onconnectionstatechange = () => {
+      logPc("onconnectionstatechange");
       const s = pc.connectionState;
+      setStatus((prev) => {
+        if (prev.startsWith("Connected") || prev.startsWith("Receiving")) {
+          return prev;
+        }
+        return `Link: ${s} · ICE: ${pc.iceConnectionState}`;
+      });
       if (s === "failed") {
+        appendDebug("[guest] connectionState=failed");
         setError(
-          "WebRTC connection failed. Different Wi‑Fi/mobile networks often need a TURN server — set NEXT_PUBLIC_TURN_* env vars."
+          "WebRTC connection failed. Try same Wi‑Fi, or add NEXT_PUBLIC_TURN_* in Vercel."
         );
       }
     };
 
+    pc.oniceconnectionstatechange = () => logPc("oniceconnectionstatechange");
+    pc.onicegatheringstatechange = () => logPc("onicegatheringstatechange");
+    pc.onsignalingstatechange = () => logPc("onsignalingstatechange");
+
+    let guestIceOut = 0;
     pc.onicecandidate = (e) => {
+      if (e.candidate) guestIceOut++;
+      else
+        appendDebug(
+          `[guest] ICE gathering complete (sent ${guestIceOut} candidates)`
+        );
       void pushIce(code, "guest", e.candidate);
     };
 
     pc.ondatachannel = (ev) => {
       const ch = ev.channel;
+      appendDebug(
+        `[guest] ondatachannel (label=${ch.label} id=${ch.id} state=${ch.readyState})`
+      );
       dcRef.current = ch;
 
       let meta: {
@@ -353,58 +526,114 @@ export function P2PTransfer() {
       };
 
       ch.onopen = () => {
+        appendDebug(`[guest] dataChannel onopen (readyState=${ch.readyState})`);
         setConnected(true);
         setStatus("Connected. Waiting for sender…");
       };
-    };
 
-    pollRef.current = setInterval(async () => {
-      const res = await fetch(`/api/signaling/rooms/${code}`, {
-        cache: "no-store",
-      });
-      if (!res.ok) return;
-      const data = (await res.json()) as {
-        offer: RTCSessionDescriptionInit | null;
-        answer: RTCSessionDescriptionInit | null;
-        iceHost: (RTCIceCandidateInit | null)[];
-        iceGuest: (RTCIceCandidateInit | null)[];
+      ch.onerror = () => {
+        appendDebug("[guest] dataChannel onerror");
       };
 
-      if (data.offer && !pc.currentRemoteDescription) {
-        try {
-          await pc.setRemoteDescription(
-            new RTCSessionDescription(data.offer)
-          );
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          await fetch(`/api/signaling/rooms/${code}`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              kind: "answer",
-              sdp: pc.localDescription!,
-            }),
-          });
-        } catch {
-          setError("Could not complete handshake");
-        }
-      }
+      ch.onclose = () => {
+        appendDebug(`[guest] dataChannel onclose (readyState=${ch.readyState})`);
+      };
+    };
 
-      if (!pc.currentRemoteDescription) {
+    let guestPollN = 0;
+    const guestPollLoop = async () => {
+      if (abortRef.current) return;
+      if (guestPollBusy.current) {
+        pollRef.current = window.setTimeout(() => void guestPollLoop(), POLL_MS);
         return;
       }
-
-      for (let i = hostIceIdx.current; i < data.iceHost.length; i++) {
-        const raw = data.iceHost[i];
-        try {
-          await pc.addIceCandidate(raw);
-          hostIceIdx.current = i + 1;
-        } catch {
-          break;
+      guestPollBusy.current = true;
+      try {
+        guestPollN += 1;
+        appendDebug(`--- guest signaling poll #${guestPollN} ---`);
+        const res = await fetch(
+          `/api/signaling/rooms/${code}?_=${Date.now()}`,
+          {
+            cache: "no-store",
+            headers: { "Cache-Control": "no-cache" },
+          }
+        );
+        if (!res.ok) {
+          appendDebug(`[guest] signaling GET failed: HTTP ${res.status}`);
+          return;
         }
+        const data = (await res.json()) as {
+          offer: RTCSessionDescriptionInit | null;
+          answer: RTCSessionDescriptionInit | null;
+          iceHost: (RTCIceCandidateInit | null)[];
+          iceGuest: (RTCIceCandidateInit | null)[];
+        };
+
+        appendDebug(
+          `[guest] snapshot: hasOffer=${!!data.offer} hasAnswer=${!!data.answer} iceHost=${data.iceHost.length} iceGuest=${data.iceGuest.length}`
+        );
+
+        if (data.offer && !pc.currentRemoteDescription) {
+          try {
+            appendDebug("[guest] setRemoteDescription(offer)…");
+            await pc.setRemoteDescription(
+              new RTCSessionDescription(data.offer)
+            );
+            logPc("after setRemoteDescription(offer)");
+            const answer = await pc.createAnswer(DATA_ONLY_ANSWER);
+            await pc.setLocalDescription(answer);
+            logPc("after setLocalDescription(answer)");
+            const postAns = await fetch(`/api/signaling/rooms/${code}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                kind: "answer",
+                sdp: pc.localDescription!,
+              }),
+            });
+            if (!postAns.ok) {
+              const t = await postAns.text();
+              throw new Error(t || `Answer HTTP ${postAns.status}`);
+            }
+            appendDebug(
+              `[guest] answer POST OK (${(pc.localDescription?.sdp?.length ?? 0)} chars sdp)`
+            );
+          } catch (e) {
+            appendDebug(`[guest] handshake error: ${String(e)}`);
+            console.error("Guest handshake", e);
+            setError("Could not complete handshake. Is the room still open?");
+          }
+        }
+
+        if (!pc.currentRemoteDescription) {
+          return;
+        }
+
+        let added = 0;
+        for (let i = hostIceIdx.current; i < data.iceHost.length; i++) {
+          const raw = data.iceHost[i];
+          try {
+            await addIceCandidateSafe(pc, raw);
+            hostIceIdx.current = i + 1;
+            added++;
+          } catch (e) {
+            appendDebug(`[guest] addIceCandidate stopped: ${String(e)}`);
+            break;
+          }
+        }
+        if (added > 0) {
+          appendDebug(`[guest] applied ${added} host ICE candidate(s)`);
+        }
+      } finally {
+        guestPollBusy.current = false;
       }
-    }, POLL_MS);
-  }, [guestInput, pushIce, teardown]);
+      if (!abortRef.current) {
+        pollRef.current = window.setTimeout(() => void guestPollLoop(), POLL_MS);
+      }
+    };
+    appendDebug("[guest] starting signaling poll loop");
+    pollRef.current = window.setTimeout(() => void guestPollLoop(), 0);
+  }, [appendDebug, guestInput, pushIce, teardown]);
 
   const reset = useCallback(() => {
     teardown();
@@ -416,6 +645,7 @@ export function P2PTransfer() {
     setJoinUrl("");
     setProgress(null);
     setConnected(false);
+    setDebugLines([]);
     abortRef.current = false;
   }, [teardown]);
 
@@ -557,6 +787,52 @@ export function P2PTransfer() {
 
       {error && mode !== "error" && (
         <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
+      )}
+
+      {(mode === "host" || mode === "guest") && (
+        <section
+          className="rounded-xl border border-zinc-300 bg-zinc-100/80 dark:border-zinc-700 dark:bg-zinc-900/60"
+          aria-label="Connection debug log"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-200 px-3 py-2 dark:border-zinc-700">
+            <p className="text-xs font-semibold uppercase tracking-wide text-zinc-600 dark:text-zinc-400">
+              Connection log (for support)
+            </p>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => void copyDebugLog()}
+                className="rounded-md bg-zinc-200 px-2 py-1 text-xs font-medium text-zinc-800 hover:bg-zinc-300 dark:bg-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-700"
+              >
+                Copy log
+              </button>
+              <button
+                type="button"
+                onClick={clearDebug}
+                className="rounded-md border border-zinc-300 px-2 py-1 text-xs dark:border-zinc-600"
+              >
+                Clear
+              </button>
+            </div>
+          </div>
+          <pre
+            className="max-h-72 overflow-y-auto whitespace-pre-wrap break-all px-3 py-2 font-mono text-[11px] leading-relaxed text-zinc-800 dark:text-zinc-300"
+            suppressHydrationWarning
+          >
+            {debugLines.length === 0 ? (
+              <span className="text-zinc-500">
+                Log lines appear as the session runs (signaling polls, WebRTC
+                states, data channel). Use Copy log after a failed attempt.
+              </span>
+            ) : (
+              debugLines.map((l) => (
+                <div key={l.id}>
+                  <span className="text-zinc-500">{l.t}</span> {l.msg}
+                </div>
+              ))
+            )}
+          </pre>
+        </section>
       )}
     </div>
   );
