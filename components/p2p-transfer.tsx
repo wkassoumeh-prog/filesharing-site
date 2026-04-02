@@ -55,6 +55,17 @@ function timeStamp(): string {
   return d.toISOString().slice(11, 23);
 }
 
+async function readApiError(res: Response): Promise<string> {
+  const t = await res.text();
+  try {
+    const j = JSON.parse(t) as { error?: string };
+    if (j.error) return `${res.status}: ${j.error}`;
+  } catch {
+    /* ignore */
+  }
+  return `${res.status}: ${t.slice(0, 400)}`;
+}
+
 async function waitForBuffer(dc: RTCDataChannel): Promise<void> {
   if (dc.bufferedAmount < MAX_BUFFER) return;
   await new Promise<void>((resolve) => {
@@ -320,23 +331,46 @@ export function P2PTransfer() {
       const offer = await pc.createOffer(DATA_ONLY_OFFER);
       await pc.setLocalDescription(offer);
       logPc("after setLocalDescription(offer)");
+      const ld0 = pc.localDescription;
+      if (!ld0?.sdp || !ld0.type) {
+        throw new Error("localDescription missing type or sdp after createOffer");
+      }
+    } catch (e) {
+      const msg = String(e);
+      appendDebug(`[host] WebRTC error: ${msg}`);
+      console.error(e);
+      setError(
+        `WebRTC (browser) failed to create an offer: ${msg}. Use a current Chrome/Safari/Firefox on HTTPS.`
+      );
+      setMode("error");
+      teardown();
+      return;
+    }
+
+    const ld = pc.localDescription!;
+    try {
+      appendDebug(
+        `[host] posting offer (${ld.sdp.length} chars, type=${ld.type})…`
+      );
       const postOffer = await fetch(`/api/signaling/rooms/${code}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           kind: "offer",
-          sdp: pc.localDescription!,
+          sdp: { type: ld.type, sdp: ld.sdp },
         }),
       });
       if (!postOffer.ok) {
-        const t = await postOffer.text();
-        throw new Error(t || `Offer HTTP ${postOffer.status}`);
+        throw new Error(await readApiError(postOffer));
       }
-      appendDebug(`[host] offer POST OK (${(pc.localDescription?.sdp?.length ?? 0)} chars sdp)`);
+      appendDebug(`[host] offer POST OK (${ld.sdp.length} chars sdp)`);
     } catch (e) {
-      appendDebug(`[host] offer failed: ${String(e)}`);
+      const msg = String(e);
+      appendDebug(`[host] offer save failed: ${msg}`);
       console.error(e);
-      setError("Could not publish WebRTC offer. Check network and try again.");
+      setError(
+        `Saving offer to the server failed: ${msg}. 404 = room missing (create room again). 503 = Redis env missing on Vercel.`
+      );
       setMode("error");
       teardown();
       return;
@@ -583,25 +617,28 @@ export function P2PTransfer() {
             const answer = await pc.createAnswer(DATA_ONLY_ANSWER);
             await pc.setLocalDescription(answer);
             logPc("after setLocalDescription(answer)");
+            const ald = pc.localDescription;
+            if (!ald?.sdp || !ald.type) {
+              throw new Error("localDescription missing after createAnswer");
+            }
             const postAns = await fetch(`/api/signaling/rooms/${code}`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
                 kind: "answer",
-                sdp: pc.localDescription!,
+                sdp: { type: ald.type, sdp: ald.sdp },
               }),
             });
             if (!postAns.ok) {
-              const t = await postAns.text();
-              throw new Error(t || `Answer HTTP ${postAns.status}`);
+              throw new Error(await readApiError(postAns));
             }
-            appendDebug(
-              `[guest] answer POST OK (${(pc.localDescription?.sdp?.length ?? 0)} chars sdp)`
-            );
+            appendDebug(`[guest] answer POST OK (${ald.sdp.length} chars sdp)`);
           } catch (e) {
             appendDebug(`[guest] handshake error: ${String(e)}`);
             console.error("Guest handshake", e);
-            setError("Could not complete handshake. Is the room still open?");
+            setError(
+              `Handshake failed: ${String(e)}. If 404, the room may have expired — get a new code from the sender.`
+            );
           }
         }
 

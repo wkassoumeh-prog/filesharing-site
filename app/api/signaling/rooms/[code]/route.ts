@@ -70,18 +70,74 @@ export async function POST(
   try {
     const redis = requireRedis();
     if (body.kind === "offer") {
-      const ok = await setOffer(redis, code, body.sdp);
-      if (!ok) {
-        return Response.json({ error: "Room not found" }, { status: 404 });
+      const sdp = body.sdp;
+      if (!sdp || typeof sdp.sdp !== "string" || sdp.sdp.length === 0) {
+        return Response.json(
+          { error: "Invalid offer: missing sdp string" },
+          { status: 400 }
+        );
       }
-      return Response.json({ ok: true });
+      const init: RTCSessionDescriptionInit = {
+        type: sdp.type === "pranswer" ? "pranswer" : "offer",
+        sdp: sdp.sdp,
+      };
+      try {
+        const ok = await setOffer(redis, code, init);
+        if (!ok) {
+          return Response.json(
+            {
+              error:
+                "Room not found or expired. Create a new room and try again.",
+            },
+            { status: 404 }
+          );
+        }
+        return Response.json({ ok: true });
+      } catch (err) {
+        console.error("[signaling] setOffer", err);
+        return Response.json(
+          {
+            error:
+              err instanceof Error ? err.message : "Redis error saving offer",
+          },
+          { status: 500 }
+        );
+      }
     }
     if (body.kind === "answer") {
-      const ok = await setAnswer(redis, code, body.sdp);
-      if (!ok) {
-        return Response.json({ error: "Room not found" }, { status: 404 });
+      const sdp = body.sdp;
+      if (!sdp || typeof sdp.sdp !== "string" || sdp.sdp.length === 0) {
+        return Response.json(
+          { error: "Invalid answer: missing sdp string" },
+          { status: 400 }
+        );
       }
-      return Response.json({ ok: true });
+      const init: RTCSessionDescriptionInit = {
+        type: sdp.type === "pranswer" ? "pranswer" : "answer",
+        sdp: sdp.sdp,
+      };
+      try {
+        const ok = await setAnswer(redis, code, init);
+        if (!ok) {
+          return Response.json(
+            {
+              error:
+                "Room not found or expired. Rejoin with a fresh room code.",
+            },
+            { status: 404 }
+          );
+        }
+        return Response.json({ ok: true });
+      } catch (err) {
+        console.error("[signaling] setAnswer", err);
+        return Response.json(
+          {
+            error:
+              err instanceof Error ? err.message : "Redis error saving answer",
+          },
+          { status: 500 }
+        );
+      }
     }
     if (body.kind === "ice") {
       const ok = await pushIceCandidate(
