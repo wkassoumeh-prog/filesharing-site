@@ -5,7 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 /** Shown when pc.connectionState === "failed" (host + guest). */
 const WEBRTC_CONNECTION_FAILED_HINT =
-  "WebRTC connection failed. Corporate or guest Wi‑Fi often blocks direct peer links; network admins may block UDP or public TURN hosts. Try another network, same LAN without AP isolation, or set NEXT_PUBLIC_TURN_URL (comma‑separate multiple URLs), NEXT_PUBLIC_TURN_USERNAME, and NEXT_PUBLIC_TURN_CREDENTIAL on Vercel—prefer turns:…:443 if your provider offers TLS.";
+  "WebRTC failed—many office/guest networks block peer traffic. Try another network (or Wi‑Fi without guest isolation), or set NEXT_PUBLIC_TURN_URL (comma‑separate URLs), NEXT_PUBLIC_TURN_USERNAME, and NEXT_PUBLIC_TURN_CREDENTIAL on Vercel; prefer turns:…:443 if your TURN provider supports TLS.";
 
 function buildIceServers(): RTCIceServer[] {
   const base: RTCIceServer[] = [
